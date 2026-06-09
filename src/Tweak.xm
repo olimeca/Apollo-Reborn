@@ -556,60 +556,15 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:completionHandler:");
     ApolloDeletedCommentsHandleRequestObservation(request, @"dataTaskWithRequest:completionHandler:");
 
-    NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
-    if (redditMediaSubmitRequest) {
-        void (^wrappedSubmitCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-            ApolloRedditTransformSubmitResponseAsync(data, redditMediaSubmitRequest, ^(NSData *transformed) {
-                completionHandler(transformed.length > 0 ? transformed : data, response, error);
-            });
-        };
-        return %orig(redditMediaSubmitRequest, wrappedSubmitCompletionHandler);
-    }
-
-    NSURLRequest *redditMediaCommentRequest = ApolloRedditMaybeRewriteCommentRequest(request);
-    if (redditMediaCommentRequest) {
-        void (^wrappedCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-            ApolloRedditTransformCommentResponseAsync(data, ^(NSData *transformed) {
-                completionHandler(transformed.length > 0 ? transformed : data, response, error);
-            });
-        };
-        return %orig(redditMediaCommentRequest, wrappedCompletionHandler);
-    }
-
+    // FIX: Handle RedGIFs auth BEFORE any other interceptors that could steal the request.
+    // ApolloRedditMaybeRewriteSubmitRequest / ApolloRedditMaybeRewriteCommentRequest were
+    // introduced after the original RedGIFs fix and can match api.redgifs.com requests,
+    // causing an early return before the RedGIFs block below is ever reached.
     NSURL *url = [request URL];
     NSString *host = [url host];
     NSString *path = [url path];
 
-    NSData *redditAlbumResponseData = sImageUploadProvider == ImageUploadProviderReddit ? ApolloRedditSyntheticImgurAlbumResponseDataForRequest(request) : nil;
-    if (sImageUploadProvider == ImageUploadProviderReddit && redditAlbumResponseData.length > 0) {
-        NSHTTPURLResponse *fakeHTTPResponse = [[NSHTTPURLResponse alloc] initWithURL:url
-                                                                          statusCode:200
-                                                                         HTTPVersion:@"HTTP/1.1"
-                                                                        headerFields:@{@"Content-Type": @"application/json"}];
-        void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
-            completionHandler(redditAlbumResponseData, fakeHTTPResponse, nil);
-        };
-        return %orig(ApolloLocalFastFailRequest(@"apollo-reddit-gallery-album"), wrappedHandler);
-    }
-
-    if ([host isEqualToString:@"imgur-apiv3.p.rapidapi.com"] && [path hasPrefix:@"/3/album"]) {
-        // Album creation needs body format conversion (form-urlencoded → JSON)
-        // URL redirect and auth are handled by _onqueue_resume
-        NSMutableURLRequest *modifiedRequest = [request mutableCopy];
-        [modifiedRequest setURL:[NSURL URLWithString:[@"https://api.imgur.com" stringByAppendingString:path]]];
-        StripRapidAPIHeaders(modifiedRequest);
-        NSString *bodyString = [[NSString alloc] initWithData:modifiedRequest.HTTPBody encoding:NSUTF8StringEncoding];
-        NSArray *components = [bodyString componentsSeparatedByString:@"="];
-        if (components.count == 2 && [components[0] isEqualToString:@"deletehashes"]) {
-            NSString *deleteHashes = components[1];
-            NSArray *hashes = [deleteHashes componentsSeparatedByString:@","];
-            NSDictionary *jsonBody = @{@"deletehashes": hashes};
-            NSData *jsonData = [NSJSONSerialization dataWithJSONObject:jsonBody options:0 error:nil];
-            [modifiedRequest setHTTPBody:jsonData];
-            [modifiedRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-        }
-        return %orig(modifiedRequest, completionHandler);
-    } else if ([host isEqualToString:@"api.redgifs.com"] && [path isEqualToString:@"/v2/oauth/client"]) {
+    if ([host isEqualToString:@"api.redgifs.com"] && [path hasPrefix:@"/v2/oauth/client"]) {
         // Redirect to the new temporary token endpoint
         NSMutableURLRequest *modifiedRequest = [request mutableCopy];
         NSURL *newURL = [NSURL URLWithString:@"https://api.redgifs.com/v2/auth/temporary"];
@@ -640,6 +595,58 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
         };
         return %orig(modifiedRequest, newCompletionHandler);
     }
+
+    NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
+    if (redditMediaSubmitRequest) {
+        void (^wrappedSubmitCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            ApolloRedditTransformSubmitResponseAsync(data, redditMediaSubmitRequest, ^(NSData *transformed) {
+                completionHandler(transformed.length > 0 ? transformed : data, response, error);
+            });
+        };
+        return %orig(redditMediaSubmitRequest, wrappedSubmitCompletionHandler);
+    }
+
+    NSURLRequest *redditMediaCommentRequest = ApolloRedditMaybeRewriteCommentRequest(request);
+    if (redditMediaCommentRequest) {
+        void (^wrappedCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            ApolloRedditTransformCommentResponseAsync(data, ^(NSData *transformed) {
+                completionHandler(transformed.length > 0 ? transformed : data, response, error);
+            });
+        };
+        return %orig(redditMediaCommentRequest, wrappedCompletionHandler);
+    }
+
+    NSData *redditAlbumResponseData = sImageUploadProvider == ImageUploadProviderReddit ? ApolloRedditSyntheticImgurAlbumResponseDataForRequest(request) : nil;
+    if (sImageUploadProvider == ImageUploadProviderReddit && redditAlbumResponseData.length > 0) {
+        NSHTTPURLResponse *fakeHTTPResponse = [[NSHTTPURLResponse alloc] initWithURL:url
+                                                                          statusCode:200
+                                                                         HTTPVersion:@"HTTP/1.1"
+                                                                        headerFields:@{@"Content-Type": @"application/json"}];
+        void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
+            completionHandler(redditAlbumResponseData, fakeHTTPResponse, nil);
+        };
+        return %orig(ApolloLocalFastFailRequest(@"apollo-reddit-gallery-album"), wrappedHandler);
+    }
+
+    if ([host isEqualToString:@"imgur-apiv3.p.rapidapi.com"] && [path hasPrefix:@"/3/album"]) {
+        // Album creation needs body format conversion (form-urlencoded → JSON)
+        // URL redirect and auth are handled by _onqueue_resume
+        NSMutableURLRequest *modifiedRequest = [request mutableCopy];
+        [modifiedRequest setURL:[NSURL URLWithString:[@"https://api.imgur.com" stringByAppendingString:path]]];
+        StripRapidAPIHeaders(modifiedRequest);
+        NSString *bodyString = [[NSString alloc] initWithData:modifiedRequest.HTTPBody encoding:NSUTF8StringEncoding];
+        NSArray *components = [bodyString componentsSeparatedByString:@"="];
+        if (components.count == 2 && [components[0] isEqualToString:@"deletehashes"]) {
+            NSString *deleteHashes = components[1];
+            NSArray *hashes = [deleteHashes componentsSeparatedByString:@","];
+            NSDictionary *jsonBody = @{@"deletehashes": hashes};
+            NSData *jsonData = [NSJSONSerialization dataWithJSONObject:jsonBody options:0 error:nil];
+            [modifiedRequest setHTTPBody:jsonData];
+            [modifiedRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        }
+        return %orig(modifiedRequest, completionHandler);
+    }
+
     return %orig(request, ApolloDeletedCommentsMaybeWrapCompletion(request, completionHandler));
 }
 
@@ -1128,7 +1135,7 @@ static void initializeRandomSources() {
     sLinkPreviewCommentsMode = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyLinkPreviewCommentsMode];
     if (sLinkPreviewCommentsMode < ApolloLinkPreviewModeOff || sLinkPreviewCommentsMode > ApolloLinkPreviewModeFull) {
         sLinkPreviewCommentsMode = ApolloLinkPreviewModeFull;
-        [standardDefaults setInteger:sLinkPreviewCommentsMode forKey:UDKeyLinkPreviewCommentsMode];
+        [standardDefaults setInteger:sLinkPreviewCommentsMode forKey:UDKeyLinkPreviewBodyMode];
     }
     sLinkPreviewCardColor = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyLinkPreviewCardColor];
     if (sLinkPreviewCardColor < ApolloLinkPreviewCardColorNeutral || sLinkPreviewCardColor > ApolloLinkPreviewCardColorSlate) {
