@@ -20,48 +20,25 @@
 #import "ApolloMarkdownToolbarGif.h"
 #import "ApolloWebAuthViewController.h"
 
-// MARK: - RedGIFs Playback Fix & JSON Traversal
+// MARK: - RedGIFs Playback Fix & JSON Traversal (Static C-Function to prevent compilation errors)
 
-%hook NSJSONSerialization
+static void modifyRedditPayload(NSMutableDictionary *dict) {
+    if (!dict || ![dict isKindOfClass:[NSMutableDictionary class]]) return;
 
-+ (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)error {
-    id json = %orig(data, opt, error);
-    
-    if ([json isKindOfClass:[NSDictionary class]]) {
-        NSMutableDictionary *mutableJson = [json mutableCopy];
-        [self modifyRedditPayload:mutableJson];
-        return [mutableJson copy];
-    } else if ([json isKindOfClass:[NSArray class]]) {
-        NSMutableArray *mutableArray = [json mutableCopy];
-        for (NSUInteger i = 0; i < mutableArray.count; i++) {
-            if ([mutableArray[i] isKindOfClass:[NSDictionary class]]) {
-                NSMutableDictionary *mutableDict = [mutableArray[i] mutableCopy];
-                [self modifyRedditPayload:mutableDict];
-                mutableArray[i] = [mutableDict copy];
-            }
-        }
-        return [mutableArray copy];
-    }
-    
-    return json;
-}
-
-%new
-+ (void)modifyRedditPayload:(NSMutableDictionary *)dict {
     for (NSString *key in [dict allKeys]) {
         id value = dict[key];
         if ([value isKindOfClass:[NSMutableDictionary class]]) {
-            [self modifyRedditPayload:value];
+            modifyRedditPayload(value);
         } else if ([value isKindOfClass:[NSDictionary class]]) {
             NSMutableDictionary *mutableChild = [value mutableCopy];
-            [self modifyRedditPayload:mutableChild];
+            modifyRedditPayload(mutableChild);
             dict[key] = [mutableChild copy];
         } else if ([value isKindOfClass:[NSArray class]]) {
             NSMutableArray *mutableArray = [value mutableCopy];
             for (NSUInteger i = 0; i < mutableArray.count; i++) {
                 if ([mutableArray[i] isKindOfClass:[NSDictionary class]]) {
                     NSMutableDictionary *mutableDict = [mutableArray[i] mutableCopy];
-                    [self modifyRedditPayload:mutableDict];
+                    modifyRedditPayload(mutableDict);
                     mutableArray[i] = [mutableDict copy];
                 }
             }
@@ -82,6 +59,30 @@
             dict[@"has_audio"] = @YES;
         }
     }
+}
+
+%hook NSJSONSerialization
+
++ (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)error {
+    id json = %orig(data, opt, error);
+    
+    if ([json isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *mutableJson = [json mutableCopy];
+        modifyRedditPayload(mutableJson);
+        return [mutableJson copy];
+    } else if ([json isKindOfClass:[NSArray class]]) {
+        NSMutableArray *mutableArray = [json mutableCopy];
+        for (NSUInteger i = 0; i < mutableArray.count; i++) {
+            if ([mutableArray[i] isKindOfClass:[NSDictionary class]]) {
+                NSMutableDictionary *mutableDict = [mutableArray[i] mutableCopy];
+                modifyRedditPayload(mutableDict);
+                mutableArray[i] = [mutableDict copy];
+            }
+        }
+        return [mutableArray copy];
+    }
+    
+    return json;
 }
 
 %end
@@ -556,220 +557,3 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
             rewritten.path = @"/api/info.json";
             rewritten.queryItems = @[
                 [NSURLQueryItem queryItemWithName:@"url" value:q],
-                [NSURLQueryItem queryItemWithName:@"raw_json" value:@"1"],
-            ];
-            NSMutableURLRequest *modifiedRequest = [request mutableCopy];
-            [modifiedRequest setURL:rewritten.URL];
-            ApolloLog(@"[URLSearch] Rerouting URL search to /api/info.json. Original: %@ Rewritten: %@", url.absoluteString, rewritten.URL.absoluteString);
-            return %orig(modifiedRequest);
-        }
-    }
-
-    // Determine whether request is for random subreddit
-    if ([url.host isEqualToString:@"oauth.reddit.com"] && [url.path hasPrefix:@"/r/random/"]) {
-        if (![sRandomSubredditsSource length]) {
-            return %orig;
-        }
-        subredditListURL = [NSURL URLWithString:sRandomSubredditsSource];
-    } else if ([url.host isEqualToString:@"oauth.reddit.com"] && [url.path hasPrefix:@"/r/randnsfw/"]) {
-        if (![sRandNsfwSubredditsSource length]) {
-            return %orig;
-        }
-        subredditListURL = [NSURL URLWithString:sRandNsfwSubredditsSource];
-    } else {
-        return %orig;
-    }
-
-    NSError *error = nil;
-    // Check cache
-    NSString *subredditListContent = [subredditListCache objectForKey:subredditListURL.absoluteString];
-    bool updateCache = false;
-
-    if (!subredditListContent) {
-        // Not in cache, so fetch subreddit list from source URL
-        // FIXME: The current implementation blocks the UI, but the prefetching in initializeRandomSources() should help
-        subredditListContent = [NSString stringWithContentsOfURL:subredditListURL encoding:NSUTF8StringEncoding error:&error];
-        if (error) {
-            return %orig;
-        }
-        updateCache = true;
-    }
-
-    // Parse the content into a list of strings
-    NSArray<NSString *> *subreddits = [subredditListContent componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-    subreddits = [subreddits filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
-    if (subreddits.count == 0) {
-        return %orig;
-    }
-
-    if (updateCache) {
-        [subredditListCache setObject:subredditListContent forKey:subredditListURL.absoluteString];
-    }
-
-    // Pick a random subreddit, then modify the request URL to use that subreddit, simulating a 302 redirect in Reddit's original API behaviour
-    NSString *randomSubreddit = subreddits[arc4random_uniform((uint32_t)subreddits.count)];
-    NSString *urlString = [url absoluteString];
-    NSString *newUrlString = [urlString stringByReplacingOccurrencesOfString:@"/random/" withString:[NSString stringWithFormat:@"/%@/", randomSubreddit]];
-    newUrlString = [newUrlString stringByReplacingOccurrencesOfString:@"/randnsfw/" withString:[NSString stringWithFormat:@"/%@/", randomSubreddit]];
-
-    NSMutableURLRequest *modifiedRequest = [request mutableCopy];
-    [modifiedRequest setURL:[NSURL URLWithString:newUrlString]];
-    return %orig(modifiedRequest);
-}
-
-// Imgur Delete and album creation
-- (NSURLSessionDataTask*)dataTaskWithRequest:(NSURLRequest*)request completionHandler:(void (^)(NSData*, NSURLResponse*, NSError*))completionHandler {
-    ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:completionHandler:");
-    ApolloDeletedCommentsHandleRequestObservation(request, @"dataTaskWithRequest:completionHandler:");
-
-    NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
-    if (redditMediaSubmitRequest) {
-        void (^wrappedSubmitCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-            ApolloRedditTransformSubmitResponseAsync(data, redditMediaSubmitRequest, ^(NSData *transformed) {
-                completionHandler(transformed.length > 0 ? transformed : data, response, error);
-            });
-        };
-        return %orig(redditMediaSubmitRequest, wrappedSubmitCompletionHandler);
-    }
-
-    NSURLRequest *redditMediaCommentRequest = ApolloRedditMaybeRewriteCommentRequest(request);
-    if (redditMediaCommentRequest) {
-        void (^wrappedCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-            ApolloRedditTransformCommentResponseAsync(data, ^(NSData *transformed) {
-                completionHandler(transformed.length > 0 ? transformed : data, response, error);
-            });
-        };
-        return %orig(redditMediaCommentRequest, wrappedCompletionHandler);
-    }
-
-    NSURL *url = [request URL];
-    NSString *host = [url host];
-    NSString *path = [url path];
-
-    NSData *redditAlbumResponseData = sImageUploadProvider == ImageUploadProviderReddit ? ApolloRedditSyntheticImgurAlbumResponseDataForRequest(request) : nil;
-    if (sImageUploadProvider == ImageUploadProviderReddit && redditAlbumResponseData.length > 0) {
-        NSHTTPURLResponse *fakeHTTPResponse = [[NSHTTPURLResponse alloc] initWithURL:url
-                                                                          statusCode:200
-                                                                         HTTPVersion:@"HTTP/1.1"
-                                                                        headerFields:@{@"Content-Type": @"application/json"}];
-        void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
-            completionHandler(redditAlbumResponseData, fakeHTTPResponse, nil);
-        };
-        return %orig(ApolloLocalFastFailRequest(@"apollo-reddit-gallery-album"), wrappedHandler);
-    }
-
-    if ([host isEqualToString:@"imgur-apiv3.p.rapidapi.com"] && [path hasPrefix:@"/3/album"]) {
-        // Album creation needs body format conversion (form-urlencoded → JSON)
-        // URL redirect and auth are handled by _onqueue_resume
-        NSMutableURLRequest *modifiedRequest = [request mutableCopy];
-        [modifiedRequest setURL:[NSURL URLWithString:[@"https://api.imgur.com" stringByAppendingString:path]]];
-        StripRapidAPIHeaders(modifiedRequest);
-        NSString *bodyString = [[NSString alloc] initWithData:modifiedRequest.HTTPBody encoding:NSUTF8StringEncoding];
-        NSArray *components = [bodyString componentsSeparatedByString:@"="];
-        if (components.count == 2 && [components[0] isEqualToString:@"deletehashes"]) {
-            NSString *deleteHashes = components[1];
-            NSArray *hashes = [deleteHashes componentsSeparatedByString:@","];
-            NSDictionary *jsonBody = @{@"deletehashes": hashes};
-            NSData *jsonData = [NSJSONSerialization dataWithJSONObject:jsonBody options:0 error:nil];
-            [modifiedRequest setHTTPBody:jsonData];
-            [modifiedRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-        }
-        return %orig(modifiedRequest, completionHandler);
-    } else if ([host isEqualToString:@"api.redgifs.com"] && [path isEqualToString:@"/v2/oauth/client"]) {
-        // Redirect to the new temporary token endpoint
-        NSMutableURLRequest *modifiedRequest = [request mutableCopy];
-        NSURL *newURL = [NSURL URLWithString:@"https://api.redgifs.com/v2/auth/temporary"];
-        [modifiedRequest setURL:newURL];
-        [modifiedRequest setHTTPMethod:@"GET"];
-        [modifiedRequest setHTTPBody:nil];
-        [modifiedRequest setValue:nil forHTTPHeaderField:@"Content-Type"];
-        [modifiedRequest setValue:nil forHTTPHeaderField:@"Content-Length"];
-
-        void (^newCompletionHandler)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-            if (!error && data) {
-                NSError *jsonError = nil;
-                NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
-                if (!jsonError && json[@"token"]) {
-                    // Transform response to match Apollo's format from '/v2/oauth/client'
-                    NSDictionary *oauthResponse = @{
-                        @"access_token": json[@"token"],
-                        @"token_type": @"Bearer",
-                        @"expires_in": @(82800), // 23 hours
-                        @"scope": @"read"
-                    };
-                    NSData *transformedData = [NSJSONSerialization dataWithJSONObject:oauthResponse options:0 error:nil];
-                    completionHandler(transformedData, response, error);
-                    return;
-                }
-            }
-            completionHandler(data, response, error);
-        };
-        return %orig(modifiedRequest, newCompletionHandler);
-    }
-    return %orig(request, ApolloDeletedCommentsMaybeWrapCompletion(request, completionHandler));
-}
-
-// "Unproxy" Imgur requests
-- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    NSURLRequest *observeRequest = url ? [NSURLRequest requestWithURL:url] : nil;
-    ApolloDeletedCommentsHandleRequestObservation(observeRequest, @"dataTaskWithURL:completionHandler:");
-
-    if ([url.host isEqualToString:@"apollogur.download"]) {
-        NSString *imageID = [url.lastPathComponent stringByDeletingPathExtension];
-
-        if (sProxyImgurDDG && [url.path hasPrefix:@"/api/image"]) {
-            // Fabricate an API response with a DDG-proxied link, skipping api.imgur.com
-            // entirely (also regionally blocked). .jpg is a neutral default; Imgur serves
-            // the correct format regardless and DDG handles both static and animated content.
-            NSString *imgurJPG = [NSString stringWithFormat:@"https://i.imgur.com/%@.jpg", imageID];
-            NSString *ddgProxied = [@"https://external-content.duckduckgo.com/iu/?u=" stringByAppendingString:
-                [imgurJPG stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
-
-            // Match the real Imgur API shape so Unbox's required-key decoding succeeds.
-            NSDictionary *syntheticResponse = @{
-                @"status": @200,
-                @"success": @YES,
-                @"data": @{
-                    @"id": imageID,
-                    @"deletehash": @"",
-                    @"account_id": [NSNull null],
-                    @"account_url": [NSNull null],
-                    @"ad_type": [NSNull null],
-                    @"ad_url": [NSNull null],
-                    @"title": [NSNull null],
-                    @"description": [NSNull null],
-                    @"name": @"",
-                    @"type": @"image/jpeg",
-                    @"width": @1920,
-                    @"height": @1080,
-                    @"size": @0,
-                    @"views": @0,
-                    @"section": [NSNull null],
-                    @"vote": [NSNull null],
-                    @"bandwidth": @0,
-                    @"animated": @NO,
-                    @"favorite": @NO,
-                    @"in_gallery": @NO,
-                    @"in_most_viral": @NO,
-                    @"has_sound": @NO,
-                    @"is_ad": @NO,
-                    @"nsfw": [NSNull null],
-                    @"link": ddgProxied,
-                    @"datetime": @1492556556
-                }
-            };
-            NSData *syntheticData = [NSJSONSerialization dataWithJSONObject:syntheticResponse options:0 error:nil];
-            NSHTTPURLResponse *fakeHTTPResponse = [[NSHTTPURLResponse alloc] initWithURL:url
-                                                                              statusCode:200
-                                                                             HTTPVersion:@"HTTP/1.1"
-                                                                            headerFields:@{@"Content-Type": @"application/json"}];
-            void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
-                completionHandler(syntheticData, fakeHTTPResponse, nil);
-            };
-            return %orig(ApolloLocalFastFailRequest(@"apollo-imgur-image"), wrappedHandler);
-        }
-    }
-    return %orig(url, ApolloDeletedCommentsMaybeWrapCompletionURL(url, completionHandler));
-}
-
-%end
