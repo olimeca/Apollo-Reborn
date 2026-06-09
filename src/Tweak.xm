@@ -173,6 +173,9 @@ static NSArray *const blockedUrls = @[
 
 // Cache storing subreddit list source URLs -> response body
 static NSCache<NSString *, NSString *> *subredditListCache;
+
+// Cached RedGIFs bearer token (populated by the auth intercept in dataTaskWithRequest:completionHandler:)
+static NSString *sRedGIFsToken = nil;
 // Replace Reddit API client ID
 %hook RDKOAuthCredential
 
@@ -579,6 +582,8 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
                 NSError *jsonError = nil;
                 NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
                 if (!jsonError && json[@"token"]) {
+                    // Cache the token so _onqueue_resume can use it to resolve watch URLs
+                    sRedGIFsToken = [json[@"token"] copy];
                     // Transform response to match Apollo's format from '/v2/oauth/client'
                     NSDictionary *oauthResponse = @{
                         @"access_token": json[@"token"],
@@ -792,6 +797,58 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
 
     NSURL *requestURL = request.URL;
     NSString *requestString = requestURL.absoluteString;
+
+    // Resolve RedGIFs watch URLs to direct .mp4 URLs with audio.
+    // Apollo hands the watch page URL (v3.redgifs.com/watch/<id> or redgifs.com/watch/<id>)
+    // directly to its media player, which can only display the silent GIF fallback.
+    // We intercept here, call the RedGIFs API to get the real HD mp4 URL, and redirect.
+    BOOL isRedGIFsWatch = ([requestURL.host hasSuffix:@"redgifs.com"] &&
+                           [requestURL.path hasPrefix:@"/watch/"]);
+    if (isRedGIFsWatch && sRedGIFsToken.length > 0) {
+        NSString *gifID = [requestURL.path substringFromIndex:@"/watch/".length];
+        // Strip any query string from the ID
+        NSRange queryRange = [gifID rangeOfString:@"?"];
+        if (queryRange.location != NSNotFound) {
+            gifID = [gifID substringToIndex:queryRange.location];
+        }
+        if (gifID.length > 0) {
+            NSString *apiURLString = [NSString stringWithFormat:@"https://api.redgifs.com/v2/gifs/%@", gifID.lowercaseString];
+            NSURL *apiURL = [NSURL URLWithString:apiURLString];
+            NSMutableURLRequest *apiRequest = [NSMutableURLRequest requestWithURL:apiURL];
+            [apiRequest setValue:[NSString stringWithFormat:@"Bearer %@", sRedGIFsToken] forHTTPHeaderField:@"Authorization"];
+
+            dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+            __block NSString *hdURL = nil;
+
+            NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:apiRequest completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                if (!error && data) {
+                    NSError *jsonError = nil;
+                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+                    NSDictionary *gif = json[@"gif"];
+                    NSDictionary *urls = gif[@"urls"];
+                    // Prefer HD, fall back to SD
+                    if (urls[@"hd"]) {
+                        hdURL = urls[@"hd"];
+                    } else if (urls[@"sd"]) {
+                        hdURL = urls[@"sd"];
+                    }
+                }
+                dispatch_semaphore_signal(semaphore);
+            }];
+            [task resume];
+            dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+
+            if (hdURL.length > 0) {
+                ApolloLog(@"[RedGIFs] Resolved %@ -> %@", requestString, hdURL);
+                NSMutableURLRequest *mutableRequest = [request mutableCopy];
+                [mutableRequest setURL:[NSURL URLWithString:hdURL]];
+                [self setValue:mutableRequest forKey:@"_originalRequest"];
+                [self setValue:mutableRequest forKey:@"_currentRequest"];
+                %orig;
+                return;
+            }
+        }
+    }
 
     // Drop blocked URLs
     for (NSString *blockedUrl in blockedUrls) {
