@@ -1050,7 +1050,123 @@ static NSUInteger ApolloDeletedCommentsInsertMissingMoreChildren(id root,
     return inserted.count;
 }
 
+#pragma mark - RedGIFs Response Rewriter
+
+// Rewrite Reddit API listing responses to fix RedGIFs posts playing as silent GIFs.
+// Reddit transcodes RedGIFs videos onto v.redd.it and marks them has_audio=false + is_gif=true.
+// Apollo reads those flags and plays content silently, never contacting RedGIFs at all.
+// Fix: detect media.type == "redgifs.com", build the direct mp4 URL from the GIF ID,
+// and rewrite the post so Apollo treats it as a hosted video with audio.
+static NSData *ApolloRewriteRedGIFsListingData(NSData *data) {
+    if (!data || data.length == 0) return data;
+
+    NSError *jsonError = nil;
+    id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:&jsonError];
+    if (jsonError || !json) return data;
+
+    NSArray *listings = [json isKindOfClass:[NSArray class]] ? (NSArray *)json : @[json];
+    BOOL modified = NO;
+
+    for (id listing in listings) {
+        if (![listing isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *listingData = listing[@"data"];
+        NSArray *children = listingData[@"children"];
+        for (id child in children) {
+            if (![child isKindOfClass:[NSDictionary class]]) continue;
+            NSMutableDictionary *postData = child[@"data"];
+            if (![postData isKindOfClass:[NSMutableDictionary class]]) continue;
+
+            // Only process RedGIFs posts
+            NSDictionary *media = postData[@"media"];
+            if (![media isKindOfClass:[NSDictionary class]]) continue;
+            if (![media[@"type"] isEqualToString:@"redgifs.com"]) continue;
+
+            // Extract GIF ID from url_overridden_by_dest
+            // e.g. https://v3.redgifs.com/watch/mortifiedhandmadeyellowthroat
+            NSString *watchURL = postData[@"url_overridden_by_dest"];
+            if (![watchURL isKindOfClass:[NSString class]]) continue;
+            NSURL *parsedURL = [NSURL URLWithString:watchURL];
+            NSString *gifIDLower = [parsedURL.path lastPathComponent];
+            if (gifIDLower.length == 0) continue;
+
+            // Get correctly-cased name from oembed thumbnail_url
+            // e.g. https://media.redgifs.com/MortifiedHandmadeYellowthroat-poster.jpg
+            NSString *gifIDCased = gifIDLower;
+            NSDictionary *oembed = media[@"oembed"];
+            if ([oembed isKindOfClass:[NSDictionary class]]) {
+                NSString *thumbURL = oembed[@"thumbnail_url"];
+                if ([thumbURL isKindOfClass:[NSString class]]) {
+                    NSString *thumbFile = [[NSURL URLWithString:thumbURL] lastPathComponent];
+                    NSString *cased = [thumbFile stringByReplacingOccurrencesOfString:@"-poster.jpg" withString:@""];
+                    if (cased.length > 0) gifIDCased = cased;
+                }
+            }
+
+            NSString *hdMP4 = [NSString stringWithFormat:@"https://media.redgifs.com/%@.mp4", gifIDCased];
+            NSString *sdMP4 = [NSString stringWithFormat:@"https://media.redgifs.com/%@-mobile.mp4", gifIDCased];
+
+            ApolloLog(@"[RedGIFs] Rewriting post %@ -> %@", gifIDLower, hdMP4);
+
+            // Build synthetic reddit_video block Apollo can play with audio
+            NSDictionary *existingRVP = postData[@"preview"][@"reddit_video_preview"];
+            NSMutableDictionary *syntheticVideo = [@{
+                @"bitrate_kbps": @5000,
+                @"fallback_url": hdMP4,
+                @"scrubber_media_url": sdMP4,
+                @"dash_url": @"",
+                @"hls_url": @"",
+                @"has_audio": @YES,
+                @"is_gif": @NO,
+                @"duration": ([existingRVP[@"duration"] isKindOfClass:[NSNumber class]] ? existingRVP[@"duration"] : @30),
+                @"height": ([existingRVP[@"height"] isKindOfClass:[NSNumber class]] ? existingRVP[@"height"] : @([oembed[@"thumbnail_height"] integerValue] ?: 1080)),
+                @"width": ([existingRVP[@"width"] isKindOfClass:[NSNumber class]] ? existingRVP[@"width"] : @([oembed[@"thumbnail_width"] integerValue] ?: 1920)),
+                @"transcoding_status": @"completed"
+            } mutableCopy];
+
+            // Inject into media and secure_media
+            NSMutableDictionary *newMedia = [media mutableCopy];
+            newMedia[@"reddit_video"] = syntheticVideo;
+            postData[@"media"] = newMedia;
+
+            NSDictionary *secureMedia = postData[@"secure_media"];
+            if ([secureMedia isKindOfClass:[NSDictionary class]]) {
+                NSMutableDictionary *newSecureMedia = [secureMedia mutableCopy];
+                newSecureMedia[@"reddit_video"] = syntheticVideo;
+                postData[@"secure_media"] = newSecureMedia;
+            }
+
+            // Fix the preview block
+            NSMutableDictionary *preview = postData[@"preview"];
+            if ([preview isKindOfClass:[NSMutableDictionary class]]) {
+                NSMutableDictionary *newRVP = [existingRVP mutableCopy] ?: [NSMutableDictionary dictionary];
+                newRVP[@"has_audio"] = @YES;
+                newRVP[@"is_gif"] = @NO;
+                newRVP[@"fallback_url"] = hdMP4;
+                newRVP[@"scrubber_media_url"] = sdMP4;
+                preview[@"reddit_video_preview"] = newRVP;
+            }
+
+            // Mark as video
+            postData[@"is_video"] = @YES;
+            postData[@"post_hint"] = @"hosted:video";
+
+            modified = YES;
+        }
+    }
+
+    if (!modified) return data;
+    NSData *rewritten = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+    return rewritten ?: data;
+}
+
+#pragma mark - ResponsePatcher
+
 static void ApolloDeletedCommentsPatchResponseAsync(NSData *data, NSURLRequest *request, void (^completion)(NSData *patchedData)) {
+    // Rewrite RedGIFs posts before any other processing.
+    // This runs for ALL Reddit API responses through the delegate pipeline,
+    // regardless of whether Show Deleted Comments is enabled.
+    data = ApolloRewriteRedGIFsListingData(data) ?: data;
+
     NSString *linkFullName = sShowDeletedComments ? ApolloDeletedCommentsLinkFullNameForRequest(request) : nil;
     if (linkFullName.length == 0 || data.length == 0) {
         completion(data);
@@ -1181,86 +1297,8 @@ static void ApolloDeletedCommentsInstallResponseTransformerForDelegate(id delega
     IMP originalDidReceiveDataIMP = didReceiveDataMethod ? method_getImplementation(didReceiveDataMethod) : NULL;
     const char *didReceiveDataTypes = didReceiveDataMethod ? method_getTypeEncoding(didReceiveDataMethod) : "v@:@@@";
     IMP didReceiveDataIMP = imp_implementationWithBlock(^(id selfObject, NSURLSession *session, NSURLSessionDataTask *dataTask, NSData *data) {
-        if (sShowDeletedComments && ApolloDeletedCommentsShouldTransformTask(dataTask) && data.length > 0) {
+        if (ApolloDeletedCommentsIsRedditHost(dataTask.originalRequest.URL.host ?: dataTask.currentRequest.URL.host) && data.length > 0) {
             NSMutableData *buffered = objc_getAssociatedObject(dataTask, kApolloDeletedCommentsResponseDataKey);
             if (!buffered) {
                 buffered = [NSMutableData data];
-                objc_setAssociatedObject(dataTask, kApolloDeletedCommentsResponseDataKey, buffered, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            }
-            [buffered appendData:data];
-            return;
-        }
-        if (originalDidReceiveDataIMP) {
-            ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))originalDidReceiveDataIMP)(selfObject, didReceiveDataSelector, session, dataTask, data);
-        }
-    });
-    class_replaceMethod(cls, didReceiveDataSelector, didReceiveDataIMP, didReceiveDataTypes);
-
-    SEL didCompleteSelector = @selector(URLSession:task:didCompleteWithError:);
-    Method didCompleteMethod = class_getInstanceMethod(cls, didCompleteSelector);
-    IMP originalDidCompleteIMP = didCompleteMethod ? method_getImplementation(didCompleteMethod) : NULL;
-    const char *didCompleteTypes = didCompleteMethod ? method_getTypeEncoding(didCompleteMethod) : "v@:@@@";
-
-    void (^deliverOriginal)(NSURLSession *, NSURLSessionTask *, NSData *, NSError *, id) = ^(NSURLSession *session, NSURLSessionTask *task, NSData *data, NSError *error, id selfObject) {
-        void (^run)(void) = ^{
-            if (data.length > 0 && originalDidReceiveDataIMP) {
-                ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))originalDidReceiveDataIMP)(selfObject, didReceiveDataSelector, session, (NSURLSessionDataTask *)task, data);
-            }
-            if (originalDidCompleteIMP) {
-                ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))originalDidCompleteIMP)(selfObject, didCompleteSelector, session, task, error);
-            }
-        };
-        NSOperationQueue *delegateQueue = session.delegateQueue;
-        if (delegateQueue) {
-            [delegateQueue addOperationWithBlock:run];
-        } else {
-            run();
-        }
-    };
-
-    IMP didCompleteIMP = imp_implementationWithBlock(^(id selfObject, NSURLSession *session, NSURLSessionTask *task, NSError *error) {
-        if (sShowDeletedComments && ApolloDeletedCommentsShouldTransformTask(task)) {
-            NSMutableData *buffered = objc_getAssociatedObject(task, kApolloDeletedCommentsResponseDataKey);
-            objc_setAssociatedObject(task, kApolloDeletedCommentsResponseDataKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            NSURLRequest *request = task.originalRequest ?: task.currentRequest;
-            if (buffered.length > 0 && !error) {
-                ApolloDeletedCommentsPatchResponseAsync(buffered, request, ^(NSData *patchedData) {
-                    deliverOriginal(session, task, patchedData.length > 0 ? patchedData : buffered, error, selfObject);
-                });
-                return;
-            }
-        }
-
-        if (originalDidCompleteIMP) {
-            ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))originalDidCompleteIMP)(selfObject, didCompleteSelector, session, task, error);
-        }
-    });
-    class_replaceMethod(cls, didCompleteSelector, didCompleteIMP, didCompleteTypes);
-
-    ApolloLog(@"[DeletedComments] Installed comments response transformer on delegate class %@", classKey);
-}
-
-void ApolloDeletedCommentsInstallDelegateTransformerIfNeeded(NSURLSession *session, NSURLRequest *request) {
-    if (!ApolloDeletedCommentsShouldTransformRequest(request)) return;
-    ApolloDeletedCommentsInstallResponseTransformerForDelegate(session.delegate);
-}
-
-#ifdef APOLLO_DELETED_COMMENTS_TESTING
-NSString *ApolloDeletedCommentsTestLinkFullNameFromRedditURL(NSURL *url) {
-    return ApolloDeletedCommentsLinkFullNameFromRedditURL(url);
-}
-
-BOOL ApolloDeletedCommentsTestBodyLooksDeleted(NSString *body, NSString *bodyHTML) {
-    NSMutableDictionary *data = [NSMutableDictionary dictionary];
-    if (body) data[@"body"] = body;
-    if (bodyHTML) data[@"body_html"] = bodyHTML;
-    return ApolloDeletedCommentsCommentDataLooksDeleted(data);
-}
-
-NSUInteger ApolloDeletedCommentsTestPatchRedditJSONRoot(id root, NSDictionary<NSString *, NSDictionary *> *archivedComments) {
-    NSMutableSet<NSString *> *visibleNames = [NSMutableSet set];
-    ApolloDeletedCommentsCollectVisibleCommentNames(root, visibleNames);
-    ApolloDeletedCommentsPatchStats stats = {0};
-    return ApolloDeletedCommentsPatchRedditJSONNode(root, archivedComments, visibleNames, &stats);
-}
-#endif
+                objc_setAssociatedObject(dataTask, kApolloDeletedCommentsResponseDataKey, buffered, 
