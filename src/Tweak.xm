@@ -173,9 +173,6 @@ static NSArray *const blockedUrls = @[
 
 // Cache storing subreddit list source URLs -> response body
 static NSCache<NSString *, NSString *> *subredditListCache;
-
-// Cached RedGIFs bearer token (populated by the auth intercept in dataTaskWithRequest:completionHandler:)
-static NSString *sRedGIFsToken = nil;
 // Replace Reddit API client ID
 %hook RDKOAuthCredential
 
@@ -446,129 +443,6 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
     return request;
 }
 
-// Rewrite Reddit API listing responses to fix RedGIFs posts playing as silent GIFs.
-//
-// Reddit transcodes RedGIFs videos onto v.redd.it and sets has_audio=false + is_gif=true
-// in the preview.reddit_video_preview block. Apollo reads those flags and plays the content
-// as a silent GIF, never contacting RedGIFs at all.
-//
-// Fix: when we detect media.type == "redgifs.com", construct the direct mp4 URL from the
-// GIF ID (extracted from url_overridden_by_dest), then rewrite the post data so Apollo
-// sees it as a hosted video with audio instead of a silent GIF.
-//
-// RedGIFs mp4 URLs follow a stable pattern:
-//   https://media.redgifs.com/<CamelCaseGifId>.mp4  (HD)
-//   https://media.redgifs.com/<CamelCaseGifId>-mobile.mp4  (SD, fallback)
-// The GIF ID in the URL is lowercase; the filename uses the original casing from the
-// thumbnail_url in the oembed block (e.g. MortifiedHandmadeYellowthroat).
-static NSData *ApolloRewriteRedGIFsListingData(NSData *data) {
-    if (!data || data.length == 0) return data;
-
-    NSError *jsonError = nil;
-    id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:&jsonError];
-    if (jsonError || !json) return data;
-
-    // The response is an array of Listing objects
-    NSArray *listings = [json isKindOfClass:[NSArray class]] ? (NSArray *)json : @[json];
-    BOOL modified = NO;
-
-    for (id listing in listings) {
-        if (![listing isKindOfClass:[NSDictionary class]]) continue;
-        NSDictionary *listingData = listing[@"data"];
-        NSArray *children = listingData[@"children"];
-        for (id child in children) {
-            if (![child isKindOfClass:[NSDictionary class]]) continue;
-            NSMutableDictionary *postData = child[@"data"];
-            if (![postData isKindOfClass:[NSMutableDictionary class]]) continue;
-
-            // Only process RedGIFs posts
-            NSDictionary *media = postData[@"media"];
-            if (![media isKindOfClass:[NSDictionary class]]) continue;
-            if (![media[@"type"] isEqualToString:@"redgifs.com"]) continue;
-
-            // Extract GIF ID from url_overridden_by_dest
-            // e.g. https://v3.redgifs.com/watch/mortifiedhandmadeyellowthroat
-            NSString *watchURL = postData[@"url_overridden_by_dest"];
-            if (![watchURL isKindOfClass:[NSString class]]) continue;
-            NSURL *parsedURL = [NSURL URLWithString:watchURL];
-            NSString *gifIDLower = [parsedURL.path lastPathComponent];
-            if (gifIDLower.length == 0) continue;
-
-            // Get the correctly-cased name from the oembed thumbnail_url
-            // e.g. https://media.redgifs.com/MortifiedHandmadeYellowthroat-poster.jpg
-            NSString *gifIDCased = gifIDLower; // fallback
-            NSDictionary *oembed = media[@"oembed"];
-            if ([oembed isKindOfClass:[NSDictionary class]]) {
-                NSString *thumbURL = oembed[@"thumbnail_url"];
-                if ([thumbURL isKindOfClass:[NSString class]]) {
-                    NSString *thumbFile = [[NSURL URLWithString:thumbURL] lastPathComponent];
-                    // Remove -poster.jpg suffix
-                    NSString *cased = [thumbFile stringByReplacingOccurrencesOfString:@"-poster.jpg" withString:@""];
-                    if (cased.length > 0) gifIDCased = cased;
-                }
-            }
-
-            NSString *hdMP4 = [NSString stringWithFormat:@"https://media.redgifs.com/%@.mp4", gifIDCased];
-            NSString *sdMP4 = [NSString stringWithFormat:@"https://media.redgifs.com/%@-mobile.mp4", gifIDCased];
-
-            ApolloLog(@"[RedGIFs] Rewriting post %@ -> %@", gifIDLower, hdMP4);
-
-            // Build a synthetic reddit_video block Apollo can play with audio
-            NSMutableDictionary *syntheticVideo = [@{
-                @"bitrate_kbps": @5000,
-                @"fallback_url": hdMP4,
-                @"scrubber_media_url": sdMP4,
-                @"dash_url": @"",
-                @"hls_url": @"",
-                @"has_audio": @YES,
-                @"is_gif": @NO,
-                @"duration": @30,
-                @"height": @([(oembed[@"thumbnail_height"] ?: @1080) integerValue]),
-                @"width": @([(oembed[@"thumbnail_width"] ?: @1920) integerValue]),
-                @"transcoding_status": @"completed"
-            } mutableCopy];
-
-            // Inject into media and secure_media so Apollo picks it up however it reads it
-            NSMutableDictionary *newMedia = [media mutableCopy];
-            newMedia[@"reddit_video"] = syntheticVideo;
-            postData[@"media"] = newMedia;
-
-            NSDictionary *secureMedia = postData[@"secure_media"];
-            if ([secureMedia isKindOfClass:[NSDictionary class]]) {
-                NSMutableDictionary *newSecureMedia = [secureMedia mutableCopy];
-                newSecureMedia[@"reddit_video"] = syntheticVideo;
-                postData[@"secure_media"] = newSecureMedia;
-            }
-
-            // Fix the preview block — Apollo may read reddit_video_preview flags
-            NSMutableDictionary *preview = postData[@"preview"];
-            if ([preview isKindOfClass:[NSDictionary class]]) {
-                NSMutableDictionary *newPreview = [preview mutableCopy];
-                NSDictionary *rvp = newPreview[@"reddit_video_preview"];
-                if ([rvp isKindOfClass:[NSDictionary class]]) {
-                    NSMutableDictionary *newRVP = [rvp mutableCopy];
-                    newRVP[@"has_audio"] = @YES;
-                    newRVP[@"is_gif"] = @NO;
-                    newRVP[@"fallback_url"] = hdMP4;
-                    newPreview[@"reddit_video_preview"] = newRVP;
-                }
-                postData[@"preview"] = newPreview;
-            }
-
-            // Mark as video so Apollo's post type detection treats it correctly
-            postData[@"is_video"] = @YES;
-            postData[@"post_hint"] = @"hosted:video";
-
-            modified = YES;
-        }
-    }
-
-    if (!modified) return data;
-
-    NSData *rewritten = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-    return rewritten ?: data;
-}
-
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
@@ -682,56 +556,6 @@ static NSData *ApolloRewriteRedGIFsListingData(NSData *data) {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:completionHandler:");
     ApolloDeletedCommentsHandleRequestObservation(request, @"dataTaskWithRequest:completionHandler:");
 
-    // FIX: Handle RedGIFs auth BEFORE any other interceptors that could steal the request.
-    // ApolloRedditMaybeRewriteSubmitRequest / ApolloRedditMaybeRewriteCommentRequest were
-    // introduced after the original RedGIFs fix and can match api.redgifs.com requests,
-    // causing an early return before the RedGIFs block below is ever reached.
-    NSURL *url = [request URL];
-    NSString *host = [url host];
-    NSString *path = [url path];
-
-    if ([host isEqualToString:@"api.redgifs.com"] && [path hasPrefix:@"/v2/oauth/client"]) {
-        // Redirect to the new temporary token endpoint
-        NSMutableURLRequest *modifiedRequest = [request mutableCopy];
-        NSURL *newURL = [NSURL URLWithString:@"https://api.redgifs.com/v2/auth/temporary"];
-        [modifiedRequest setURL:newURL];
-        [modifiedRequest setHTTPMethod:@"GET"];
-        [modifiedRequest setHTTPBody:nil];
-        [modifiedRequest setValue:nil forHTTPHeaderField:@"Content-Type"];
-        [modifiedRequest setValue:nil forHTTPHeaderField:@"Content-Length"];
-
-        void (^newCompletionHandler)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-            if (!error && data) {
-                NSError *jsonError = nil;
-                NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
-                if (!jsonError && json[@"token"]) {
-                    // Cache the token so _onqueue_resume can use it to resolve watch URLs
-                    sRedGIFsToken = [json[@"token"] copy];
-                    // Transform response to match Apollo's format from '/v2/oauth/client'
-                    NSDictionary *oauthResponse = @{
-                        @"access_token": json[@"token"],
-                        @"token_type": @"Bearer",
-                        @"expires_in": @(82800), // 23 hours
-                        @"scope": @"read"
-                    };
-                    NSData *transformedData = [NSJSONSerialization dataWithJSONObject:oauthResponse options:0 error:nil];
-                    completionHandler(transformedData, response, error);
-                    return;
-                }
-            }
-            completionHandler(data, response, error);
-        };
-        return %orig(modifiedRequest, newCompletionHandler);
-    }
-
-    // Wrap Reddit API listing responses to fix RedGIFs posts playing as silent GIFs
-    if ([host isEqualToString:@"oauth.reddit.com"] || [host isEqualToString:@"www.reddit.com"]) {
-        void (^wrappedRedGIFsHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-            completionHandler(ApolloRewriteRedGIFsListingData(data), response, error);
-        };
-        return %orig(request, wrappedRedGIFsHandler);
-    }
-
     NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
     if (redditMediaSubmitRequest) {
         void (^wrappedSubmitCompletionHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
@@ -751,6 +575,10 @@ static NSData *ApolloRewriteRedGIFsListingData(NSData *data) {
         };
         return %orig(redditMediaCommentRequest, wrappedCompletionHandler);
     }
+
+    NSURL *url = [request URL];
+    NSString *host = [url host];
+    NSString *path = [url path];
 
     NSData *redditAlbumResponseData = sImageUploadProvider == ImageUploadProviderReddit ? ApolloRedditSyntheticImgurAlbumResponseDataForRequest(request) : nil;
     if (sImageUploadProvider == ImageUploadProviderReddit && redditAlbumResponseData.length > 0) {
@@ -781,8 +609,37 @@ static NSData *ApolloRewriteRedGIFsListingData(NSData *data) {
             [modifiedRequest setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
         }
         return %orig(modifiedRequest, completionHandler);
-    }
+    } else if ([host isEqualToString:@"api.redgifs.com"] && [path isEqualToString:@"/v2/oauth/client"]) {
+        // Redirect to the new temporary token endpoint
+        NSMutableURLRequest *modifiedRequest = [request mutableCopy];
+        NSURL *newURL = [NSURL URLWithString:@"https://api.redgifs.com/v2/auth/temporary"];
+        [modifiedRequest setURL:newURL];
+        [modifiedRequest setHTTPMethod:@"GET"];
+        [modifiedRequest setHTTPBody:nil];
+        [modifiedRequest setValue:nil forHTTPHeaderField:@"Content-Type"];
+        [modifiedRequest setValue:nil forHTTPHeaderField:@"Content-Length"];
 
+        void (^newCompletionHandler)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            if (!error && data) {
+                NSError *jsonError = nil;
+                NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+                if (!jsonError && json[@"token"]) {
+                    // Transform response to match Apollo's format from '/v2/oauth/client'
+                    NSDictionary *oauthResponse = @{
+                        @"access_token": json[@"token"],
+                        @"token_type": @"Bearer",
+                        @"expires_in": @(82800), // 23 hours
+                        @"scope": @"read"
+                    };
+                    NSData *transformedData = [NSJSONSerialization dataWithJSONObject:oauthResponse options:0 error:nil];
+                    completionHandler(transformedData, response, error);
+                    return;
+                }
+            }
+            completionHandler(data, response, error);
+        };
+        return %orig(modifiedRequest, newCompletionHandler);
+    }
     return %orig(request, ApolloDeletedCommentsMaybeWrapCompletion(request, completionHandler));
 }
 
@@ -928,58 +785,6 @@ static NSData *ApolloRewriteRedGIFsListingData(NSData *data) {
 
     NSURL *requestURL = request.URL;
     NSString *requestString = requestURL.absoluteString;
-
-    // Resolve RedGIFs watch URLs to direct .mp4 URLs with audio.
-    // Apollo hands the watch page URL (v3.redgifs.com/watch/<id> or redgifs.com/watch/<id>)
-    // directly to its media player, which can only display the silent GIF fallback.
-    // We intercept here, call the RedGIFs API to get the real HD mp4 URL, and redirect.
-    BOOL isRedGIFsWatch = ([requestURL.host hasSuffix:@"redgifs.com"] &&
-                           [requestURL.path hasPrefix:@"/watch/"]);
-    if (isRedGIFsWatch && sRedGIFsToken.length > 0) {
-        NSString *gifID = [requestURL.path substringFromIndex:@"/watch/".length];
-        // Strip any query string from the ID
-        NSRange queryRange = [gifID rangeOfString:@"?"];
-        if (queryRange.location != NSNotFound) {
-            gifID = [gifID substringToIndex:queryRange.location];
-        }
-        if (gifID.length > 0) {
-            NSString *apiURLString = [NSString stringWithFormat:@"https://api.redgifs.com/v2/gifs/%@", gifID.lowercaseString];
-            NSURL *apiURL = [NSURL URLWithString:apiURLString];
-            NSMutableURLRequest *apiRequest = [NSMutableURLRequest requestWithURL:apiURL];
-            [apiRequest setValue:[NSString stringWithFormat:@"Bearer %@", sRedGIFsToken] forHTTPHeaderField:@"Authorization"];
-
-            dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-            __block NSString *hdURL = nil;
-
-            NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:apiRequest completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-                if (!error && data) {
-                    NSError *jsonError = nil;
-                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
-                    NSDictionary *gif = json[@"gif"];
-                    NSDictionary *urls = gif[@"urls"];
-                    // Prefer HD, fall back to SD
-                    if (urls[@"hd"]) {
-                        hdURL = urls[@"hd"];
-                    } else if (urls[@"sd"]) {
-                        hdURL = urls[@"sd"];
-                    }
-                }
-                dispatch_semaphore_signal(semaphore);
-            }];
-            [task resume];
-            dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
-
-            if (hdURL.length > 0) {
-                ApolloLog(@"[RedGIFs] Resolved %@ -> %@", requestString, hdURL);
-                NSMutableURLRequest *mutableRequest = [request mutableCopy];
-                [mutableRequest setURL:[NSURL URLWithString:hdURL]];
-                [self setValue:mutableRequest forKey:@"_originalRequest"];
-                [self setValue:mutableRequest forKey:@"_currentRequest"];
-                %orig;
-                return;
-            }
-        }
-    }
 
     // Drop blocked URLs
     for (NSString *blockedUrl in blockedUrls) {
@@ -1323,7 +1128,7 @@ static void initializeRandomSources() {
     sLinkPreviewCommentsMode = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyLinkPreviewCommentsMode];
     if (sLinkPreviewCommentsMode < ApolloLinkPreviewModeOff || sLinkPreviewCommentsMode > ApolloLinkPreviewModeFull) {
         sLinkPreviewCommentsMode = ApolloLinkPreviewModeFull;
-        [standardDefaults setInteger:sLinkPreviewCommentsMode forKey:UDKeyLinkPreviewBodyMode];
+        [standardDefaults setInteger:sLinkPreviewCommentsMode forKey:UDKeyLinkPreviewCommentsMode];
     }
     sLinkPreviewCardColor = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyLinkPreviewCardColor];
     if (sLinkPreviewCardColor < ApolloLinkPreviewCardColorNeutral || sLinkPreviewCardColor > ApolloLinkPreviewCardColorSlate) {
