@@ -1301,4 +1301,87 @@ static void ApolloDeletedCommentsInstallResponseTransformerForDelegate(id delega
             NSMutableData *buffered = objc_getAssociatedObject(dataTask, kApolloDeletedCommentsResponseDataKey);
             if (!buffered) {
                 buffered = [NSMutableData data];
-                objc_setAssociatedObject(dataTask, kApolloDeletedCommentsResponseDataKey, buffered, 
+                objc_setAssociatedObject(dataTask, kApolloDeletedCommentsResponseDataKey, buffered, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            [buffered appendData:data];
+            return;
+        }
+        if (originalDidReceiveDataIMP) {
+            ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))originalDidReceiveDataIMP)(selfObject, didReceiveDataSelector, session, dataTask, data);
+        }
+    });
+    class_replaceMethod(cls, didReceiveDataSelector, didReceiveDataIMP, didReceiveDataTypes);
+
+    SEL didCompleteSelector = @selector(URLSession:task:didCompleteWithError:);
+    Method didCompleteMethod = class_getInstanceMethod(cls, didCompleteSelector);
+    IMP originalDidCompleteIMP = didCompleteMethod ? method_getImplementation(didCompleteMethod) : NULL;
+    const char *didCompleteTypes = didCompleteMethod ? method_getTypeEncoding(didCompleteMethod) : "v@:@@@";
+
+    void (^deliverOriginal)(NSURLSession *, NSURLSessionTask *, NSData *, NSError *, id) = ^(NSURLSession *session, NSURLSessionTask *task, NSData *data, NSError *error, id selfObject) {
+        void (^run)(void) = ^{
+            if (data.length > 0 && originalDidReceiveDataIMP) {
+                ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))originalDidReceiveDataIMP)(selfObject, didReceiveDataSelector, session, (NSURLSessionDataTask *)task, data);
+            }
+            if (originalDidCompleteIMP) {
+                ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))originalDidCompleteIMP)(selfObject, didCompleteSelector, session, task, error);
+            }
+        };
+        NSOperationQueue *delegateQueue = session.delegateQueue;
+        if (delegateQueue) {
+            [delegateQueue addOperationWithBlock:run];
+        } else {
+            run();
+        }
+    };
+
+    IMP didCompleteIMP = imp_implementationWithBlock(^(id selfObject, NSURLSession *session, NSURLSessionTask *task, NSError *error) {
+        NSURLRequest *request = task.originalRequest ?: task.currentRequest;
+        BOOL isRedditHost = ApolloDeletedCommentsIsRedditHost(request.URL.host);
+        NSMutableData *buffered = objc_getAssociatedObject(task, kApolloDeletedCommentsResponseDataKey);
+
+        if (isRedditHost && buffered.length > 0 && !error) {
+            objc_setAssociatedObject(task, kApolloDeletedCommentsResponseDataKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            ApolloDeletedCommentsPatchResponseAsync(buffered, request, ^(NSData *patchedData) {
+                deliverOriginal(session, task, patchedData.length > 0 ? patchedData : buffered, error, selfObject);
+            });
+            return;
+        }
+
+        // Clear any buffered data even if we're not processing it
+        if (buffered) {
+            objc_setAssociatedObject(task, kApolloDeletedCommentsResponseDataKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+
+        if (originalDidCompleteIMP) {
+            ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))originalDidCompleteIMP)(selfObject, didCompleteSelector, session, task, error);
+        }
+    });
+    class_replaceMethod(cls, didCompleteSelector, didCompleteIMP, didCompleteTypes);
+
+    ApolloLog(@"[DeletedComments] Installed comments response transformer on delegate class %@", classKey);
+}
+
+void ApolloDeletedCommentsInstallDelegateTransformerIfNeeded(NSURLSession *session, NSURLRequest *request) {
+    if (!ApolloDeletedCommentsIsRedditHost(request.URL.host)) return;
+    ApolloDeletedCommentsInstallResponseTransformerForDelegate(session.delegate);
+}
+
+#ifdef APOLLO_DELETED_COMMENTS_TESTING
+NSString *ApolloDeletedCommentsTestLinkFullNameFromRedditURL(NSURL *url) {
+    return ApolloDeletedCommentsLinkFullNameFromRedditURL(url);
+}
+
+BOOL ApolloDeletedCommentsTestBodyLooksDeleted(NSString *body, NSString *bodyHTML) {
+    NSMutableDictionary *data = [NSMutableDictionary dictionary];
+    if (body) data[@"body"] = body;
+    if (bodyHTML) data[@"body_html"] = bodyHTML;
+    return ApolloDeletedCommentsCommentDataLooksDeleted(data);
+}
+
+NSUInteger ApolloDeletedCommentsTestPatchRedditJSONRoot(id root, NSDictionary<NSString *, NSDictionary *> *archivedComments) {
+    NSMutableSet<NSString *> *visibleNames = [NSMutableSet set];
+    ApolloDeletedCommentsCollectVisibleCommentNames(root, visibleNames);
+    ApolloDeletedCommentsPatchStats stats = {0};
+    return ApolloDeletedCommentsPatchRedditJSONNode(root, archivedComments, visibleNames, &stats);
+}
+#endif
