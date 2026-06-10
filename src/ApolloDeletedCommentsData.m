@@ -212,11 +212,6 @@ static BOOL ApolloDeletedCommentsShouldTransformRequest(NSURLRequest *request) {
     return ApolloDeletedCommentsLinkFullNameForRequest(request).length > 0;
 }
 
-static BOOL ApolloDeletedCommentsShouldTransformTask(NSURLSessionTask *task) {
-    if (![task isKindOfClass:[NSURLSessionTask class]]) return NO;
-    return ApolloDeletedCommentsShouldTransformRequest(task.originalRequest) ||
-           ApolloDeletedCommentsShouldTransformRequest(task.currentRequest);
-}
 
 void ApolloDeletedCommentsHandleRequestObservation(NSURLRequest *request, NSString *source) {
     if (!sShowDeletedComments) return;
